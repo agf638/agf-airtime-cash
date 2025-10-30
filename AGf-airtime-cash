@@ -1,0 +1,175 @@
+mobile network:mtn,airtime amount 1000000, phone number 07074335101,user iD 11626322463546414384 this is for details about index.html. 
+require firebase-admin this is for.requirements.txt 
+import os
+import json
+import time
+import uuid
+import requests
+from http.server import BaseHTTPRequestHandler
+from firebase_admin import initialize_app, firestore, credentials
+from firebase_admin.exceptions import FirebaseError
+
+# --- INITIALIZATION ---
+try:
+    # Environment variables are set in Vercel configuration
+    FIREBASE_CONFIG_JSON = os.environ.get('FIREBASE_CONFIG_JSON')
+    VT_PASS_API_KEY = os.environ.get('VT_PASS_API_KEY')
+    FLUTTERWAVE_SECRET_KEY = os.environ.get('FLUTTERWAVE_SECRET_KEY')
+    APP_ID = os.environ.get('APP_ID', 'default-app-id') # Use the APP_ID from Vercel env
+    
+    if not all([FIREBASE_CONFIG_JSON, VT_PASS_API_KEY, FLUTTERWAVE_SECRET_KEY]):
+        raise ValueError("Missing one or more required environment variables.")
+
+    # 1. Initialize Firebase Admin SDK
+    cred_json = json.loads(FIREBASE_CONFIG_JSON)
+    cred = credentials.Certificate(cred_json)
+    initialize_app(cred)
+    db = firestore.client()
+
+    # Constants
+    APP_COLLECTION = "transactions"
+    
+    # Airtime to Cash Rate (80% cash back)
+    CASH_RATE = 0.8 
+
+    initialization_success = True
+
+except (ValueError, json.JSONDecodeError, FirebaseError, Exception) as e:
+    print(f"CRITICAL INIT ERROR: {e}")
+    initialization_success = False
+
+# --- UTILITIES ---
+
+def log_error(transaction_id, message, error_details=None):
+    """Logs an error to the console and returns a standard error dictionary."""
+    print(f"ERROR [TX ID: {transaction_id}]: {message}")
+    if error_details:
+        print(f"  Details: {error_details}")
+    return {"message": message, "error": error_details, "transactionId": transaction_id}
+
+def respond(handler, status, data):
+    """Sends the JSON response back to the client."""
+    handler.send_response(status)
+    handler.send_header('Content-type', 'application/json')
+    handler.end_headers()
+    handler.wfile.write(json.dumps(data).encode('utf-8'))
+
+def get_vtpass_info(service_id):
+    """Fetches VTpass service details (like recipient number) for a network."""
+    # NOTE: VTpass usually requires an agent number or a specific product ID for airtime transfer.
+    # For a real implementation, you would need to query VTpass or hardcode the specific recipient 
+    # numbers for each network and for this specific service.
+    
+    # --- MOCK DATA for Airtime to Cash service ---
+    # In a real scenario, this would be an actual agent number for airtime transfer.
+    NETWORK_RECIPIENTS = {
+        "MTN": {"recipient_number": "08012345678", "service_name": "MTN Airtime to Cash"},
+        "GLO": {"recipient_number": "08098765432", "service_name": "GLO Airtime to Cash"},
+        "AIRTEL": {"recipient_number": "07066667777", "service_name": "AIRTEL Airtime to Cash"},
+        "9MOBILE": {"recipient_number": "09055554444", "service_name": "9MOBILE Airtime to Cash"},
+    }
+    return NETWORK_RECIPIENTS.get(service_id)
+
+# --- TRANSACTION PROCESSING LOGIC ---
+
+def create_initial_transaction(data):
+    """Creates the initial transaction document in Firestore."""
+    try:
+        user_id = data.get('userId')
+        airtime_amount = data.get('airtimeAmount')
+        network = data.get('network')
+        phone_number = data.get('phoneNumber')
+        
+        # 1. Calculate Cash Amount
+        cash_amount = airtime_amount * CASH_RATE
+
+        # 2. Get VTpass recipient info
+        vtpass_info = get_vtpass_info(network)
+        if not vtpass_info:
+            return log_error("N/A", "Invalid network selected or VTpass info missing."), 400
+
+        # 3. Generate Transaction ID and initial data
+        tx_id = str(uuid.uuid4())
+        timestamp = int(time.time() * 1000)
+        
+        transaction_data = {
+            "id": tx_id,
+            "userId": user_id,
+            "airtimeAmount": airtime_amount,
+            "cashAmount": cash_amount,
+            "network": network,
+            "sourceNumber": phone_number,
+            "recipientNumber": vtpass_info['recipient_number'],
+            "vtpassServiceName": vtpass_info['service_name'],
+            "status": "PENDING", # Awaiting user airtime transfer
+            "createdAt": timestamp,
+            "updatedAt": timestamp,
+            "errorMessage": None,
+        }
+
+        # 4. Use Firestore Batch for Atomicity
+        batch = db.batch()
+        
+        # a) Set Transaction Document
+        tx_doc_ref = db.collection('artifacts').document(APP_ID).collection('users').document(user_id).collection(APP_COLLECTION).document(tx_id)
+        batch.set(tx_doc_ref, transaction_data)
+        
+        # b) Update User's Active Transaction ID (to prevent multiple submissions)
+        user_doc_ref = db.collection('artifacts').document(APP_ID).collection('users').document(user_id)
+        batch.set(user_doc_ref, {"activeTransactionId": tx_id}, merge=True)
+        
+        batch.commit()
+        
+        print(f"Transaction {tx_id} created for user {user_id}. Awaiting airtime transfer.")
+        return {"transactionId": tx_id, "message": "Transaction initiated. Please transfer airtime."}, 200
+
+    except Exception as e:
+        return log_error("N/A", f"Internal server error during transaction creation: {e}"), 500
+
+# --- VERCEL SERVERLESS FUNCTION HANDLER ---
+
+class handler(BaseHTTPRequestHandler):
+    """Handles incoming HTTP requests for the Vercel serverless function."""
+
+    def do_POST(self):
+        """Processes POST request to start a new transaction."""
+        
+        if not initialization_success:
+            return respond(self, 503, log_error("N/A", "Service is unavailable due to critical initialization error."))
+        
+        try:
+            # 1. Read Request Body
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+        except (KeyError, json.JSONDecodeError, ValueError) as e:
+            return respond(self, 400, log_error("N/A", f"Invalid request body: {e}"))
+
+        # 2. Validate essential fields
+        required_fields = ['airtimeAmount', 'network', 'phoneNumber', 'userId']
+        for field in required_fields:
+            if field not in data:
+                return respond(self, 400, log_error("N/A", f"Missing required field: {field}"))
+        
+        # Basic type/value validation
+        try:
+            data['airtimeAmount'] = float(data['airtimeAmount'])
+            if data['airtimeAmount'] <= 0:
+                raise ValueError
+        except ValueError:
+            return respond(self, 400, log_error("N/A", "airtimeAmount must be a positive number."))
+
+        # 3. Create the Transaction
+        response_data, status_code = create_initial_transaction(data)
+        respond(self, status_code, response_data)
+
+    def do_GET(self):
+        """A simple GET handler for status check (optional but good practice)."""
+        respond(self, 200, {"message": "Airtime to Cash API is running.", "initialized": initialization_success, "appId": APP_ID})
+
+# --- NOTE FOR REAL-WORLD IMPLEMENTATION ---
+# The logic above handles the initiation and Firestore updates.
+# A full, robust implementation would require a separate **Webhook Listener** # to automatically update the transaction status in Firestore when a 
+# successful airtime transfer is detected on the recipient number.
+# This simple setup requires manual verification and update of the Firestore 
+# document by an administrator to trigger the Flutterwave bank payment.this is for folder Api (containing index.py)
