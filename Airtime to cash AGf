@@ -1,0 +1,166 @@
+Airtime to cash:mobile network:mtn, airtime amount:1000000, phone number:07074335101, user ID:11626322463546414384 this is for index.html.
+requirements.txt: require firebase-admin this is for requirements.txt
+the folder api(containing index.py)from http.server import BaseHTTPRequestHandler
+import json
+import os
+import requests
+from firebase_admin import initialize_app, firestore, credentials
+from firebase_admin.exceptions import FirebaseError
+
+# --- INITIALIZATION ---
+# This part runs once when the Vercel function starts up.
+
+db = None
+INITIALIZATION_ERROR = None
+
+try:
+    # 1. Environment Variables Check
+    FIREBASE_CONFIG_JSON = os.environ.get('FIREBASE_CONFIG_JSON')
+    
+    # Check if the critical environment variable is set
+    if not FIREBASE_CONFIG_JSON:
+        raise ValueError("FIREBASE_CONFIG_JSON environment variable is not set. Please set it in Vercel settings.")
+
+    # 2. Parse and Initialize Firestore Admin SDK
+    try:
+        cred_json = json.loads(FIREBASE_CONFIG_JSON)
+    except json.JSONDecodeError:
+        raise ValueError("FIREBASE_CONFIG_JSON is not a valid JSON string.")
+
+    cred = credentials.Certificate(cred_json)
+    
+    # NOTE: initialize_app is idempotent (safe to call multiple times if not initialized)
+    # We use a try/except to catch if the app was already initialized (e.g., in a long-running instance)
+    try:
+        app = initialize_app(cred)
+    except ValueError as e:
+        # If app is already initialized, it's fine.
+        if "The default Firebase app already exists" not in str(e):
+             raise e
+
+    db = firestore.client()
+
+except Exception as e:
+    # Store the initialization error to report it during the request
+    db = None 
+    INITIALIZATION_ERROR = str(e)
+    print(f"FATAL: Firebase initialization failed: {INITIALIZATION_ERROR}")
+    
+# --- Vercel Serverless Function Handler ---
+class handler(BaseHTTPRequestHandler):
+    """
+    Handles POST requests to the /api/index endpoint.
+    Vercel automatically routes to this handler.
+    """
+    
+    # Helper to send a standardized error response
+    def _send_error(self, status_code, message):
+        self.send_response(status_code)
+        self.send_header('Content-type', 'application/json')
+        # Allow cross-origin requests for the frontend
+        self.send_header('Access-Control-Allow-Origin', '*') 
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            "message": message,
+            "error": "Submission failed."
+        }).encode())
+
+    # Vercel needs this for OPTIONS pre-flight checks
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+
+    def do_POST(self):
+        # Set CORS header
+        self.send_header('Access-Control-Allow-Origin', '*')
+
+        # 1. Check Server Initialization Status
+        if db is None:
+            self._send_error(500, f"Server initialization failed. Check Vercel logs for FIREBASE_CONFIG_JSON error: {INITIALIZATION_ERROR}")
+            return
+
+        # 2. Get Data from Request Body
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+        except Exception as e:
+            self._send_error(400, "Invalid JSON in request body.")
+            return
+
+        # 3. Extract and Validate Input
+        user_id = data.get('userId')
+        airtime_amount = data.get('airtimeAmount')
+        network = data.get('network')
+        phone_number = data.get('phoneNumber')
+
+        if not all([user_id, airtime_amount, network, phone_number]):
+            self._send_error(400, "Missing required fields (userId, airtimeAmount, network, phoneNumber).")
+            return
+
+        try:
+            airtime_amount = float(airtime_amount)
+            if airtime_amount <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            self._send_error(400, "Invalid airtime amount.")
+            return
+            
+        # 4. Calculate Conversion (Simulated 80% rate)
+        CONVERSION_RATE = 0.80
+        cash_amount = airtime_amount * CONVERSION_RATE
+        
+        # 5. Create New Transaction Document in Firestore
+        try:
+            # Get App ID (provided by Canvas environment or default)
+            app_id = os.environ.get('__app_id', 'airtime-cash-app') 
+            
+            # Firestore path structure: /artifacts/{appId}/users/{userId}/transactions/{docId}
+            transaction_ref = db.collection(f'artifacts/{app_id}/users/{user_id}/transactions').document()
+            transaction_id = transaction_ref.id
+            
+            # 5b. Define initial state
+            transaction_data = {
+                "transactionId": transaction_id,
+                "userId": user_id,
+                "airtimeAmount": airtime_amount,
+                "cashAmount": cash_amount,
+                "network": network,
+                "phoneNumber": phone_number,
+                "status": "PENDING", # Initial status
+                # SIMULATED: The number the user should transfer airtime to. 
+                # In a real app, this would be fetched from VTpass or a similar service.
+                "recipientNumber": "08012345678", 
+                "createdAt": firestore.SERVER_TIMESTAMP,
+            }
+            transaction_ref.set(transaction_data)
+            
+            # 5c. Optional: Update user metadata (helpful for checking active transactions later)
+            user_doc_ref = db.document(f'artifacts/{app_id}/users/{user_id}')
+            user_doc_ref.set({"activeTransactionId": transaction_id}, merge=True)
+
+        except FirebaseError as e:
+            print(f"Firestore Error: {e}")
+            self._send_error(500, f"Database communication failed: {str(e)}")
+            return
+        except Exception as e:
+             print(f"General Transaction Error: {e}")
+             self._send_error(500, f"Failed to save transaction: {str(e)}")
+             return
+
+        # 6. Send Success Response
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        response_data = {
+            "message": "Transaction initiated successfully.",
+            "transactionId": transaction_id,
+            "airtimeAmount": airtime_amount,
+            "cashAmount": cash_amount,
+            "recipientNumber": transaction_data["recipientNumber"]
+        }
+        self.wfile.write(json.dumps(response_data).encode()) this is for folder api (containing index.py)
